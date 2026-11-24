@@ -53,6 +53,10 @@ from vllm.v1.attention.backends.mla.indexer import (
     dense_logits_rows,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_cuda_alike():
@@ -151,6 +155,7 @@ def sparse_attn_indexer_kpool(
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
+    use_ampere_logits = current_platform.is_device_capability_family(80)
 
     fused_mqa_topk = use_fused_mqa_topk(
         query_shape=q_quant.shape[1:],
@@ -427,18 +432,25 @@ def sparse_attn_indexer_kpool(
                     )
                     # Compressed: row i starts at K position cu_seqlen_ks[i].
                     row_ends = cu_seqlen_ke[rows] - cu_seqlen_ks[rows]
-                    logits = as_fp32_logits(
-                        fp8_fp4_mqa_logits(
-                            (q_slice_cast[rows], q_scale_rows),
-                            (k_quant_cast, k_scale_cast),
-                            chunk_weights,
-                            cu_seqlen_ks[rows],
-                            cu_seqlen_ke[rows],
+                    if use_ampere_logits:
+                        logits = fp8_mqa_logits_triton(
+                            q_slice_cast[rows], (k_quant_cast, k_scale_cast),
+                            chunk_weights, cu_seqlen_ks[rows], cu_seqlen_ke[rows],
                             chunk.max_seqlen_k,
-                            logits_dtype=logits_dtype,
-                        ),
-                        row_ends,
-                    )
+                        )
+                    else:
+                        logits = as_fp32_logits(
+                            fp8_fp4_mqa_logits(
+                                (q_slice_cast[rows], q_scale_rows),
+                                (k_quant_cast, k_scale_cast),
+                                chunk_weights,
+                                cu_seqlen_ks[rows],
+                                cu_seqlen_ke[rows],
+                                chunk.max_seqlen_k,
+                                logits_dtype=logits_dtype,
+                            ),
+                            row_ends,
+                        )
                     if logits.shape[1] == 0:
                         topk_dst[rows].fill_(-1)
                     else:
@@ -665,20 +677,27 @@ def sparse_attn_indexer_kpool(
             logits_dtype,
         )
         # SM100 decode is varlen: one row and context length per token.
-        logits = as_fp32_logits(
-            fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                decode_weights,
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_pool_len,
-                logits_dtype=logits_dtype,
+        if use_ampere_logits:
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast, kv_cache, decode_weights, seq_lens,
+                decode_metadata.block_table, max_model_len=max_pool_len,
                 indices=decode_metadata.indices,
-            ),
-            seq_lens.view(-1),
-        )
+            )
+        else:
+            logits = as_fp32_logits(
+                fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    decode_weights,
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_pool_len,
+                    logits_dtype=logits_dtype,
+                    indices=decode_metadata.indices,
+                ),
+                seq_lens.view(-1),
+            )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
@@ -787,7 +806,10 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if current_platform.is_device_capability_family(80):
+            if use_fp4_cache:
+                raise ValueError("The Ampere kpool indexer requires an FP8 indexer cache.")
+        elif current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
             )

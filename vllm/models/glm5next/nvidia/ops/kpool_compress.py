@@ -16,10 +16,25 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
-from vllm.v1.attention.ops.common import pack_ue8m0_x4
+from vllm.platforms import current_platform
+from vllm.v1.attention.ops.common import f32_to_e4m3_uint8, pack_ue8m0_x4
 
 # The GLM-5.3-Flash indexer head dimension is fixed at 128.
 INDEX_HEAD_DIM = 128
+
+
+def _fp8_output_view(tensor: torch.Tensor) -> torch.Tensor:
+    # An FP8 destination pointer requests an unsupported PTX conversion on SM80.
+    if current_platform.is_cuda() and not current_platform.has_device_capability(89):
+        return tensor.view(torch.uint8)
+    return tensor
+
+
+@triton.jit
+def _fp8_store_value(value, pointer):
+    if pointer.dtype.element_ty == tl.uint8:
+        return f32_to_e4m3_uint8(value)
+    return value
 
 
 # Hadamard-128 rotation
@@ -103,7 +118,8 @@ def _fwht_quant_kernel(
     scale = tl.exp2(tl.ceil(tl.log2(absmax * (1.0 / 448.0))))
     y = tl.minimum(tl.maximum(x / scale[:, None], -448.0), 448.0)
 
-    tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :], y, mask=rmask[:, None])
+    tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :],
+             _fp8_store_value(y, qout_ptr), mask=rmask[:, None])
     tl.store(sout_ptr + rows, scale, mask=rmask)
 
 
@@ -130,7 +146,7 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return q_fp8, q_scale
     BLOCK_R = 32
     grid = (triton.cdiv(n_rows, BLOCK_R),)
-    _fwht_quant_kernel[grid](q, q_fp8, q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2)
+    _fwht_quant_kernel[grid](q, _fp8_output_view(q_fp8), q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2)
     return q_fp8, q_scale
 
 
@@ -247,7 +263,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
             + S_OFFSET_NBYTES_IN_PAGE // 4
             + loc_token_offset_in_page
         )
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
+        tl.store(buf_fp8_ptr + out_k_offsets, _fp8_store_value(quantized, buf_fp8_ptr), mask=mask)
         if MX_SCALE:
             tl.store(
                 buf_fp32_ptr.to(tl.pointer_type(tl.int32)) + out_s_offset,
@@ -260,7 +276,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
     if RETURN_COMPRESSED:
         tl.store(
             compressed_k_ptr + row * HEAD_DIM + offs,
-            quantized,
+            _fp8_store_value(quantized, compressed_k_ptr),
             mask=offs < HEAD_DIM,
         )
         tl.store(compressed_scale_ptr + row, scale)
@@ -332,7 +348,7 @@ def kpool_compress_and_write_cache(
             )
         return None
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    buf_fp8 = _fp8_output_view(buf.view(torch.float8_e4m3fn))
     buf_fp32 = buf.view(torch.float32)
     mx_scale = write_cache and mqa_logits_use_mx_scales()
     # bytes per page (last dim of kv_cache) viewed as uint8
@@ -360,7 +376,7 @@ def kpool_compress_and_write_cache(
         ape,
         loc,
         write_mask,
-        compressed_k,
+        _fp8_output_view(compressed_k),
         compressed_scale,
         slot_k.stride(0),
         slot_k.stride(1),
@@ -617,7 +633,7 @@ def _kpool_decode_update_batched_kernel(
                 + S_OFFSET_NBYTES_IN_PAGE // 4
                 + loc_token_offset_in_page
             )
-            tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+            tl.store(buf_fp8_ptr + out_k_offsets, _fp8_store_value(quantized, buf_fp8_ptr), mask=dim_mask)
             if MX_SCALE:
                 tl.store(
                     buf_fp32_ptr.to(tl.pointer_type(tl.int32)) + out_s_offset,
@@ -703,7 +719,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
 
     page_size = kv_cache.shape[1]
     buf = kv_cache
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    buf_fp8 = _fp8_output_view(buf.view(torch.float8_e4m3fn))
     buf_fp32 = buf.view(torch.float32)
 
     # The kernel indexes the int tensors as ``req * next_n + t`` (row-major),

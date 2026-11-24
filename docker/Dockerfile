@@ -674,6 +674,33 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ] && \
 
 #################### WHEEL BUILD IMAGE ####################
 
+#################### LMCACHE BUILD IMAGE ####################
+# Build the wtdcode/LMCache fork wheel against this image's torch. Kept as its
+# own stage so bumping LMCACHE_REF only recompiles LMCache (~minutes), and the
+# runtime stages (which have no nvcc) just install the wheel.
+FROM build AS lmcache-build
+ARG LMCACHE_REPO=https://github.com/wtdcode/LMCache.git
+ARG LMCACHE_REF=2acb7b24bea5ac55c5dfc6a41366099236ec525c
+# Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
+ARG torch_cuda_arch_list
+ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+ARG max_jobs=16
+ENV MAX_JOBS=${max_jobs}
+ARG nvcc_threads
+ENV NVCC_THREADS=$nvcc_threads
+
+ARG INSTALL_LMCACHE=false
+RUN --mount=type=cache,target=/opt/uv/cache \
+    mkdir -p /workspace/lmcache-dist && \
+    if [ "$INSTALL_LMCACHE" != "true" ]; then exit 0; fi; \
+    git clone ${LMCACHE_REPO} /workspace/lmcache-src \
+    && cd /workspace/lmcache-src \
+    && git checkout ${LMCACHE_REF} \
+    && uv pip install --python /opt/venv/bin/python3 pip -r requirements/build.txt \
+    && CUDA_HOME=/usr/local/cuda /opt/venv/bin/python3 -m pip wheel . \
+        --no-build-isolation --no-deps -w /workspace/lmcache-dist \
+    && ls /workspace/lmcache-dist
+
 #################### DEV IMAGE ####################
 FROM base AS dev
 
@@ -1271,6 +1298,16 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             uv pip install --system -c /tmp/kv-constraints.txt "mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"; \
         fi; \
         rm -f /tmp/kv-installed.txt /tmp/kv-constraints.txt; \
+    fi
+
+ARG INSTALL_LMCACHE=false
+RUN --mount=from=lmcache-build,source=/workspace/lmcache-dist,target=/tmp/lmcache-dist,ro \
+    --mount=type=cache,target=/opt/uv/cache \
+    if [ "$INSTALL_LMCACHE" = "true" ]; then \
+        uv pip freeze --system | grep -E '^(torch|torchaudio|torchvision|triton|cuda-bindings|cuda-python|cuda-toolkit)==' > /tmp/lmcache-constraints.txt && \
+        uv pip install --system -c /tmp/lmcache-constraints.txt /tmp/lmcache-dist/*.whl && \
+        python3 -c "import lmcache" && lmcache --help >/dev/null && \
+        rm /tmp/lmcache-constraints.txt; \
     fi
 
 # Install the AWS EFA userspace with the KV connectors: NIXL's LIBFABRIC plugin
