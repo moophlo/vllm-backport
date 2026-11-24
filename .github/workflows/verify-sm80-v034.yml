@@ -1,0 +1,31 @@
+name: Verify v0.34 SM80 source port
+on:
+  push:
+    branches: [ci/sm80-v034-port]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Import the pinned release into the fork's Git object store
+        env:
+          TARGET: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$TARGET" HEAD 2>/dev/null; then
+            git fetch --no-tags https://github.com/vllm-project/vllm.git refs/tags/v0.34.0
+            test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$TARGET"
+            bridge=$(git -c user.name='SM80 port CI' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit-tree 'HEAD^{tree}' -p HEAD -p "$TARGET" -m 'Import the official v0.34.0 parent for the source port')
+            git push origin "$bridge:refs/heads/ci/sm80-v034-port"
+          fi
+      - name: Check the integrated source
+        if: hashFiles('ci/sm80/check-v034.sh') != ''
+        run: bash ci/sm80/check-v034.sh
