@@ -21,7 +21,7 @@ Use dedicated runners for this public repository. This workflow accepts the sche
 
 The build targets `docker/Dockerfile`, stage `vllm-openai`, platform `linux/amd64`, with `torch_cuda_arch_list=8.0`, `nvcc_threads=1`, and `INSTALL_LMCACHE=true`. That architecture setting applies to the source build. Bundled third-party wheels can contain kernels for other architectures.
 
-A successful compile uploads `ghcr.io/moophlo/vllm-backport:candidate-<build-id>`. The test pulls that exact digest, verifies compute capability 8.0, exercises the fork's FP8 lookup and runs prefill and decode with a small local BF16 Llama using dummy weights. This is a generic serving smoke test. GLM, tensor parallelism, Ray Serve and NIXL require workload qualification.
+A successful compile uploads `ghcr.io/moophlo/vllm-backport:candidate-<build-id>`. The test pulls that exact digest, verifies compute capability 8.0, exercises the FP8 lookup, checks GLM kpool prefill and decode against an independent CPU reference (including four-token verification and non-contiguous cache pages), and runs prefill and decode with a small local BF16 Llama using dummy weights. A full GLM checkpoint, tensor parallelism, Ray Serve and NIXL require workload qualification.
 
 Passing validation publishes `:<upstream-tag>-sm80` and, if the release is still current, `:latest-sm80`. Use the digest in `build.json` for an immutable deployment. Each successful GitHub Release attaches `backport.patch` and `build.json`. Its Git tag points to the controller revision. To reproduce the image source, check out the official commit recorded in `build.json`, run `git apply --index backport.patch` (skip an empty patch), and compare `git write-tree` with `tree` in the manifest.
 
