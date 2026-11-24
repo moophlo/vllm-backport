@@ -42,9 +42,17 @@ bash ci/sm80/prepare.sh "$candidate" "$target" \
 Exit code 3 means source conflicts. Resolve them in the candidate checkout and inspect the staged changes, including CUDA paths and their tests. After staging the resolution, commit it and push the commit to a branch of this fork. For example, for release `v0.34.0` use the following commands.
 
 ```bash
+set -e
 git -C "$candidate" status --short
 # After editing the conflicted files
 git -C "$candidate" add -A
+# GitHub needs the history of the official release on the first push from
+# this shallow, disposable checkout. Keep the fork's own automation on
+# the maintenance branch.
+git -C "$candidate" fetch --no-tags --unshallow upstream "$target"
+git -C "$candidate" fetch --no-tags --depth=1 port \
+    refs/heads/master:refs/remotes/port/master
+git -C "$candidate" restore --staged --worktree --source=refs/remotes/port/master -- .github
 git -C "$candidate" commit -m "Port SM80 changes onto v0.34.0"
 git -C "$candidate" push port HEAD:refs/heads/ports/v0.34.0
 tip=$(git -C "$candidate" rev-parse HEAD)
