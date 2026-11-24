@@ -1,0 +1,82 @@
+name: Ray Serve LLM SM80 image
+on:
+  push:
+    branches: [master]
+    paths: [.github/workflows/ray-sm80.yml]
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["vLLM SM80 backport"]
+    branches: [master]
+    types: [completed]
+permissions:
+  contents: read
+  actions: read
+  packages: write
+concurrency:
+  group: ray-sm80-publication
+  cancel-in-progress: false
+jobs:
+  package:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check whether a new base was published
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          if [[ -n "$SOURCE_RUN" ]]; then
+            published=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/jobs" --jq '[.jobs[] | select(.name=="publish" and .conclusion=="success")] | length')
+            [[ "$published" != 0 ]] || exit 0
+          fi
+          echo 'build=true' >> "$GITHUB_OUTPUT"
+      - name: Install Ray on the released backport and verify Serve imports
+        if: steps.plan.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          digest() { docker buildx imagetools inspect "$1" | awk '$1=="Digest:" && !d {d=$2} END {print d}'; }
+          base=$(digest "$image:latest-sm80")
+          [[ $base =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir context
+          cd context
+          cat >Dockerfile <<'DOCKER'
+          ARG BASE
+          FROM ${BASE}
+          ARG RAY_VERSION
+          RUN set -eu; \
+              root=$(python3 -c 'from importlib.metadata import distribution; print(distribution("vllm").locate_file("vllm"))'); \
+              find "$root" -type f ! -name '*.pyc' -exec sha256sum {} + > /tmp/vllm.sha; \
+              python3 -m pip freeze --all | grep -Ei '^(vllm|torch|torchvision|torchaudio|triton|lmcache|nixl|nvidia-[a-z0-9-]+)==' > /tmp/constraints; \
+              python3 -m pip install --no-cache-dir -c /tmp/constraints "ray[serve,llm]==${RAY_VERSION}"; \
+              sha256sum --check --quiet /tmp/vllm.sha; rm /tmp/vllm.sha /tmp/constraints
+          ENTRYPOINT []
+          CMD ["bash"]
+          DOCKER
+          docker build --platform linux/amd64 --build-arg BASE="$image@$base" --build-arg RAY_VERSION=2.60.1 -t ray-sm80:check .
+          docker run --rm --network none ray-sm80:check python3 -c '
+          from importlib.metadata import version
+          from ray.serve.llm import build_openai_app, build_pd_openai_app
+          from ray.llm._internal.serve.core.ingress import builder
+          from ray.llm._internal.serve.serving_patterns.prefill_decode import builder as pd_builder
+          import nixl
+          assert callable(build_openai_app) and callable(build_pd_openai_app)
+          print("Verified Ray", version("ray"), "vLLM", version("vllm"), "NIXL", version("nixl"))'
+          docker run --rm ray-sm80:check ray --version
+          version=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' ray-sm80:check)
+          [[ $version =~ ^v[0-9][a-zA-Z0-9._-]*-sm80$ ]]
+          test "$(digest "$image:$version")" = "$base"
+          docker tag ray-sm80:check "$image:$version-ray"
+          docker push "$image:$version-ray"
+          shipped=$(digest "$image:$version-ray")
+          [[ $shipped =~ ^sha256:[a-f0-9]{64}$ ]]
+          test "$(digest "$image:latest-sm80")" = "$base"
+          docker buildx imagetools create --prefer-index=false -t "$image:latest-sm80-ray" "$image@$shipped"
+          test "$(digest "$image:latest-sm80-ray")" = "$shipped"
+          echo "Verified $image:$version-ray and latest-sm80-ray -> $shipped"
