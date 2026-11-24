@@ -24,6 +24,7 @@ mapfile -t paths < <(git -C "$checkout" diff --cached --name-only --diff-filter=
 "$venv/bin/python" ci/sm80/compile-v034.py "$checkout"
 cpu_wheel='https://github.com/vllm-project/vllm/releases/download/v0.34.0/vllm-0.34.0%2Bcpu-cp38-abi3-manylinux_2_39_x86_64.whl'
 uv pip install --python "$venv/bin/python" --torch-backend=cpu "$cpu_wheel" pytest
+TRITON_INTERPRET=1 "$venv/bin/python" ci/sm80/compile-v034.py "$checkout" --check-metadata
 site=$("$venv/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
 for path in "${paths[@]}"; do
     if [[ $path == vllm/* ]]; then install -D -m 0644 "$checkout/$path" "$site/$path"; fi
