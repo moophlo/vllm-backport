@@ -1,0 +1,24 @@
+diff --git a/setup_extensions/build_profiles/cuda.py b/setup_extensions/build_profiles/cuda.py
+--- a/setup_extensions/build_profiles/cuda.py
++++ b/setup_extensions/build_profiles/cuda.py
+@@ -154,7 +154,7 @@
+                 sources=cuda_sources,
+                 include_dirs=[CSRC_DIR],
+                 extra_compile_args={
+-                    "cxx": [flag_cxx_abi, "-std=c++17"],
++                    "cxx": [flag_cxx_abi],
+                     "nvcc": nvcc_flags,
+                 },
+             ),
+diff --git a/setup_extensions/common_cpp.py b/setup_extensions/common_cpp.py
+--- a/setup_extensions/common_cpp.py
++++ b/setup_extensions/common_cpp.py
+@@ -91,7 +91,7 @@
+             extra_compile_args={
+                 "cxx": (
+                     (profile.extra_cxx_flags_for(spec) if profile else [])
+-                    + ["-O3", "-std=c++17"]
++                    + ["-O3"]
+                 ),
+             },
+         )

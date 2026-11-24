@@ -690,12 +690,14 @@ ARG nvcc_threads
 ENV NVCC_THREADS=$nvcc_threads
 
 ARG INSTALL_LMCACHE=false
-RUN --mount=type=cache,target=/opt/uv/cache \
+RUN --mount=type=bind,source=docker/lmcache-torch-cxx.patch,target=/tmp/lmcache-torch-cxx.patch,ro \
+    --mount=type=cache,target=/opt/uv/cache \
     mkdir -p /workspace/lmcache-dist && \
     if [ "$INSTALL_LMCACHE" != "true" ]; then exit 0; fi; \
     git clone ${LMCACHE_REPO} /workspace/lmcache-src \
     && cd /workspace/lmcache-src \
     && git checkout ${LMCACHE_REF} \
+    && { if [ "$LMCACHE_REF" = 2acb7b24bea5ac55c5dfc6a41366099236ec525c ]; then git apply /tmp/lmcache-torch-cxx.patch; fi; } \
     && uv pip install --python /opt/venv/bin/python3 pip -r requirements/build.txt \
     && CUDA_HOME=/usr/local/cuda /opt/venv/bin/python3 -m pip wheel . \
         --no-build-isolation --no-deps -w /workspace/lmcache-dist \
