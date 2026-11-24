@@ -35,19 +35,8 @@ while IFS= read -r -d '' status && IFS= read -r -d '' path; do
 done < <(git diff --no-renames --name-status -z "$TARGET" HEAD -- vllm)
 "$work/venv/bin/wheel" pack "$unpacked" --dest-dir "$context/wheels"
 
-# Pin both upstream image manifests for the entire build. Buildx resolves
-# linux/amd64 from the pinned index when a tag contains multiple platforms.
-pinned_image() {
-    local ref=$1 manifest digest
-    manifest=$(docker buildx imagetools inspect "$ref")
-    digest=$(awk '$1=="Digest:" {print $2; exit}' <<<"$manifest")
-    [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
-    printf '%s@%s\n' "$ref" "$digest"
-}
-runtime=$(pinned_image docker.io/vllm/vllm-openai:v0.34.0)
-toolkit=$(pinned_image docker.io/nvidia/cuda:13.0.3-devel-ubuntu24.04)
-echo "Building from $runtime with $toolkit"
+install -m 0644 docker/lmcache-torch-cxx.patch "$context/lmcache-torch-cxx.patch"
+runtime=$(sed -n 's/^ARG VLLM_IMAGE=//p' "$recipe/Dockerfile.v034")
 docker buildx build --platform linux/amd64 --file "$recipe/Dockerfile.v034" \
-    --build-arg "VLLM_IMAGE=$runtime" --build-arg "CUDA_IMAGE=$toolkit" \
     --build-arg "JOBS=$jobs" --label "org.opencontainers.image.base.name=$runtime" \
     "$@" "$context"

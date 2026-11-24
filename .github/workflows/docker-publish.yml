@@ -183,8 +183,9 @@ jobs:
                   --metadata-file "$RUNNER_TEMP/sm80-build.json" --push)
           if [[ $BUILD_ENVIRONMENT == github-hosted &&
                 $TARGET == 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca &&
-                $(git hash-object docker/Dockerfile) == e0e4108318387af823132965b1bcb20a808cda34 ]] &&
+                $(git hash-object docker/Dockerfile) == 8d2633d7f3ae326ce2fc91c0106befa7049e21f6 ]] &&
              git diff --quiet "$TARGET" HEAD -- . ':(top,exclude)docker/Dockerfile' \
+               ':(top,exclude)docker/lmcache-torch-cxx.patch' \
                ':(top,exclude)docs' ':(top,exclude)tests' ':(top,glob,exclude)vllm/**/*.py'; then
             bash "$GITHUB_WORKSPACE/controller/ci/sm80/build-v034.sh" "$jobs" "${common[@]}"
           else

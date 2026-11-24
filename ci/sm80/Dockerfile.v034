@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-ARG VLLM_IMAGE
-ARG CUDA_IMAGE
+ARG VLLM_IMAGE=docker.io/vllm/vllm-openai:v0.34.0@sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1
+ARG CUDA_IMAGE=docker.io/nvidia/cuda:13.0.3-devel-ubuntu24.04@sha256:b7ae301dea2c162444795462ce17a05f6a516e5a75944b57af5b88540a1a2266
 FROM ${CUDA_IMAGE} AS toolkit
 
 FROM ${VLLM_IMAGE} AS lmcache-build
@@ -9,11 +9,13 @@ ARG LMCACHE_REF=2acb7b24bea5ac55c5dfc6a41366099236ec525c
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \
     && rm -rf /var/lib/apt/lists/*
 RUN --mount=from=toolkit,source=/usr/local/cuda-13.0,target=/usr/local/cuda-13.0,ro \
+    --mount=type=bind,source=lmcache-torch-cxx.patch,target=/tmp/lmcache-torch-cxx.patch,ro \
     set -eu; export CUDA_HOME=/usr/local/cuda-13.0 PATH="/usr/local/cuda-13.0/bin:$PATH"; \
     export TORCH_CUDA_ARCH_LIST=8.0 BUILD_WITH_CUDA=1 NVCC_THREADS=1 MAX_JOBS="$JOBS"; \
     python3 -c 'import torch; assert torch.version.cuda == "13.0", torch.version.cuda'; \
     git clone --quiet https://github.com/wtdcode/LMCache.git /tmp/lmcache; \
     cd /tmp/lmcache; git checkout -q --detach "$LMCACHE_REF"; test "$(git rev-parse HEAD)" = "$LMCACHE_REF"; \
+    git apply /tmp/lmcache-torch-cxx.patch; \
     python3 -m pip install --no-cache-dir -r requirements/build.txt; \
     python3 -m pip wheel --no-cache-dir --no-build-isolation --no-deps -w /out .
 
