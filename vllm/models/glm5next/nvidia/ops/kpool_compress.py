@@ -33,8 +33,10 @@ def _fp8_output_view(tensor: torch.Tensor) -> torch.Tensor:
 @triton.jit
 def _fp8_store_value(value, pointer):
     if pointer.dtype.element_ty == tl.uint8:
-        return f32_to_e4m3_uint8(value)
-    return value
+        stored = f32_to_e4m3_uint8(value)
+    else:
+        stored = value.to(pointer.dtype.element_ty)
+    return stored
 
 
 # Hadamard-128 rotation
