@@ -53,7 +53,7 @@ jobs:
           RUN set -eu; \
               root=$(python3 -c 'from importlib.metadata import distribution; print(distribution("vllm").locate_file("vllm"))'); \
               find "$root" -type f ! -name '*.pyc' -exec sha256sum {} + > /tmp/vllm.sha; \
-              python3 -m pip freeze --all | grep -Ei '^(vllm|torch|torchvision|torchaudio|triton|lmcache|nixl|nvidia-[a-z0-9-]+)==' > /tmp/constraints; \
+              python3 -m pip freeze --all | grep -Ei '^(vllm|torch|torchvision|torchaudio|triton|lmcache|nvidia-[a-z0-9-]+)==' > /tmp/constraints; \
               python3 -m pip install --no-cache-dir -c /tmp/constraints "ray[serve,llm]==${RAY_VERSION}"; \
               sha256sum --check --quiet /tmp/vllm.sha; rm /tmp/vllm.sha /tmp/constraints
           ENTRYPOINT []
@@ -65,6 +65,12 @@ jobs:
           from ray.serve.llm import build_openai_app, build_pd_openai_app
           from ray.llm._internal.serve.core.ingress import builder
           from ray.llm._internal.serve.serving_patterns.prefill_decode import builder as pd_builder
+          from importlib.metadata import requires
+          from packaging.requirements import Requirement
+          for raw in requires("vllm") or []:
+              req = Requirement(raw)
+              if req.name.lower().startswith("nixl") and (req.marker is None or req.marker.evaluate()):
+                  assert version(req.name) in req.specifier, raw
           import nixl
           assert callable(build_openai_app) and callable(build_pd_openai_app)
           print("Verified Ray", version("ray"), "vLLM", version("vllm"), "NIXL", version("nixl"))'
