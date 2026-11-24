@@ -53,7 +53,7 @@ jobs:
           RUN set -eu; \
               root=$(python3 -c 'from importlib.metadata import distribution; print(distribution("vllm").locate_file("vllm"))'); \
               find "$root" -type f ! -name '*.pyc' -exec sha256sum {} + > /tmp/vllm.sha; \
-              python3 -m pip freeze --all | grep -Ei '^(vllm|torch|torchvision|torchaudio|triton|lmcache|nvidia-[a-z0-9-]+)==' > /tmp/constraints; \
+              python3 -m pip list --format=freeze | grep -Ei '^(vllm|torch|torchvision|torchaudio|triton|lmcache|nvidia-[a-z0-9-]+)==' > /tmp/constraints; \
               python3 -m pip install --no-cache-dir uv==0.9.18; \
               uv pip install --system --override /tmp/constraints "ray[serve,llm]==${RAY_VERSION}"; \
               sha256sum --check --quiet /tmp/vllm.sha; rm /tmp/vllm.sha /tmp/constraints
