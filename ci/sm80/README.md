@@ -2,7 +2,13 @@
 
 GitHub Actions checks the official `vllm-project/vllm` stable release at minute 23 every six hours (UTC). Changing the workflow or the files in `ci/sm80` on `master` also starts an attempt. Run **vLLM SM80 backport** from Actions for an immediate check.
 
-The controller lives on `master`. `port.json` pins the official commit used as the base of the maintained port and the port commit containing the desired changes. The initial pins are the base documented in wtdcode's port commits and the wtdcode `master` snapshot used to create this fork. The workflow resolves the official release tag to its commit, applies the net port delta with a three-way Git merge, and preserves upstream changes in other files. This also works across diverging release branches. New fixes on wtdcode require a deliberate update of the two pins.
+The controller lives on `master`. `port.json` pins the official release commit and the maintained SM80 source commit. The workflow applies their difference to each new stable release with a three-way Git merge. It can handle diverging release branches. Changes from wtdcode enter the maintained port when its pins are updated.
+
+## v0.34.0 and Model Runner V2
+
+The port for v0.34.0 covers the shared DeepSeek V3.2 sparse MLA path, the GLM-5.3-Flash pooled indexer and GLM pipeline-parallel loading. On Ampere the indexer uses software E4M3 conversion and Triton paged logits. During decode it uses the physical page-table row and causal context length that Model Runner V2 prepares for each query token, including mixed speculative verification lengths. The sparse MLA backend supports the main latent cache in BF16 or FP16. The indexer keeps its separate packed FP8 cache.
+
+The original wtdcode snapshot is available at [29e66da](https://github.com/wtdcode/vllm-backport/tree/29e66dad461b11caae6039f510eaa7913f9dfb19). Its DeepSeek V4/V4.1 and Qwen-specific optimizations have separate code paths and are outside this release port's coverage. [Source changes](https://github.com/moophlo/vllm-backport/compare/62d4bc3c7e33b1b6c906e233e6af2d3506c482ca...9f60dd276313d225ee7da38f520652904cee8ebe) · [SM80 cross-compilation and CPU numerical checks](https://github.com/moophlo/vllm-backport/actions/runs/45370982907/job/138364876390)
 
 ## Runners
 
@@ -21,7 +27,7 @@ Use dedicated runners for this public repository. This workflow accepts the sche
 
 The build targets `docker/Dockerfile`, stage `vllm-openai`, platform `linux/amd64`, with `torch_cuda_arch_list=8.0`, `nvcc_threads=1`, and `INSTALL_LMCACHE=true`. That architecture setting applies to the source build. Bundled third-party wheels can contain kernels for other architectures.
 
-A successful compile uploads `ghcr.io/moophlo/vllm-backport:candidate-<build-id>`. The test pulls that exact digest, verifies compute capability 8.0, exercises the FP8 lookup, checks GLM kpool prefill and decode against an independent CPU reference (including four-token verification and non-contiguous cache pages), and runs prefill and decode with a small local BF16 Llama using dummy weights. A full GLM checkpoint, tensor parallelism, Ray Serve and NIXL require workload qualification.
+A successful compile uploads `ghcr.io/moophlo/vllm-backport:candidate-<build-id>`. The test pulls that exact digest, verifies compute capability 8.0, exercises the FP8 lookup, checks GLM kpool prefill and decode against an independent CPU reference (including four-token verification, non-contiguous cache pages and mixed-length requests that select different tokens), and runs prefill and decode with a small local BF16 Llama using dummy weights. A full GLM checkpoint, tensor parallelism, Ray Serve and NIXL require workload qualification.
 
 Passing validation publishes `:<upstream-tag>-sm80` and, if the release is still current, `:latest-sm80`. Use the digest in `build.json` for an immutable deployment. Each successful GitHub Release attaches `backport.patch` and `build.json`. Its Git tag points to the controller revision. To reproduce the image source, check out the official commit recorded in `build.json`, run `git apply --index backport.patch` (skip an empty patch), and compare `git write-tree` with `tree` in the manifest.
 
