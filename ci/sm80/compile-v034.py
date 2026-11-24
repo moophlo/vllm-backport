@@ -13,6 +13,7 @@ from triton.compiler import ASTSource
 
 root = Path(sys.argv[1])
 kernels = {
+    "vllm/models/deepseek_v32/common/kernels.py": {"_rms_norm", "_get_cos_sin", "_fp8_ue8m0_quantize", "_fp8_quant_and_cache_write", "_fused_norm_rope_kernel", "_fused_q_kernel"},
     "vllm/v1/attention/ops/metadata.py": {"_token_request", "_indexer_decode_metadata_kernel"},
     "vllm/v1/attention/ops/common.py": {"f32_to_e4m3_uint8", "e4m3_uint8_to_f32", "pack_ue8m0_x4"},
     "vllm/v1/attention/ops/mqa_logits_triton.py": {"_fp8_mqa_logits_kernel", "_fp8_paged_mqa_logits_kernel"},
@@ -26,7 +27,7 @@ def compile_kernel(fn, pointers, constants, warps=4):
             signature[name] = "constexpr"
         elif name in pointers:
             signature[name] = "*" + pointers[name]
-        elif name == "sm_scale_log2":
+        elif name == "sm_scale_log2" or name.endswith("_eps") or name in ("index_weights_head_scale", "index_weights_softmax_scale"):
             signature[name] = "fp32"
         elif name.startswith("stride_") or name == "kv_block_stride_bytes":
             signature[name] = "i64"
@@ -92,6 +93,37 @@ with TemporaryDirectory() as tmp:
                    dict(query_start_loc="i32", seq_lens="i32", block_table="i32",
                         output_seq_lens="i32", output_block_table="i32", decode_lens="i32",
                         indices="i32", per_req_lens="i32"), dict(BLOCK_COLS=32))
+    # Match the BF16 latent cache and separate E4M3 index cache selected on A100.
+    q_ptrs = dict(pos_ptr="i64", q_pe_ptr="bf16", q_pe_cos_sin_ptr="bf16",
+                  index_q_ptr="bf16", index_q_cos_sin_ptr="bf16", index_q_fp8_ptr="u8",
+                  ql_nope_ptr="bf16", mqa_q_fp8_ptr="bf16", q_scale_ptr="fp32",
+                  q_pe_out_ptr="bf16", index_weights_ptr="fp32", index_weights_out_ptr="fp32")
+    norm_ptrs = dict(pos_ptr="i64", q_c_ptr="bf16", q_rms_norm_w_ptr="bf16",
+                     q_c_out_ptr="bf16", kv_ptr="bf16", kv_rms_norm_w_ptr="bf16",
+                     kv_out_ptr="bf16", kpe_ptr="bf16", kpe_rope_cos_sin_cache_ptr="bf16",
+                     kpe_out_ptr="bf16", index_k_ptr="bf16", index_k_layer_norm_w_ptr="bf16",
+                     index_k_layer_norm_bias_ptr="bf16", index_k_rope_cos_sin_cache_ptr="bf16",
+                     index_k_out_ptr="bf16", slot_mapping_ptr="i64", indexer_slot_mapping_ptr="i64",
+                     indexer_cache_ptr="u8", indexer_cache_scale_ptr="fp32", mla_cache_ptr="bf16",
+                     mla_cache_scale_ptr="fp32", mla_cache_ds_scale_ptr="fp32",
+                     mla_cache_ds_rope_ptr="bf16", topk_indices_ptr="i32")
+    for has_indexer in (True, False):
+        dsa = dict(HAS_INDEXER=has_indexer, INDEX_ROPE_INTERLEAVE=True, USE_PDL=False,
+                   FP8_MAX=448.0, USE_FNUZ=False, EMULATE_FP8=True)
+        compile_kernel(k._fused_q_kernel, q_ptrs,
+                       dict(dsa, NUM_Q_HEADS=32, Q_PE_HALF_ROT_DIM=32,
+                            NUM_INDEX_Q_HEADS=32, INDEX_Q_HALF_ROT_DIM=32,
+                            INDEX_Q_HEAD_DIM=128, QL_NOPE_DIM=512, QL_NOPE_BLOCK=512,
+                            QUANTIZE_MQA=False), 1)
+        compile_kernel(k._fused_norm_rope_kernel, norm_ptrs,
+                       dict(dsa, Q_DIM=1536, Q_BLOCK_SIZE=2048, KV_DIM=512,
+                            KPE_HALF_ROT_DIM=32, INDEX_K_DIM=128, INDEX_K_BLOCK_SIZE=128,
+                            INDEX_K_HALF_ROT_DIM=32, INDEXER_CACHE_SHUFFLE=False,
+                            INDEXER_CACHE_BLOCK_TILE=4, INDEXER_CACHE_HEAD_TILE=16,
+                            INDEXER_CACHE_MX_SCALE=False, MLA_CACHE_BLOCK_SIZE=64,
+                            MLA_CACHE_FP8=False, SKIP_MLA_SCALE=False, MLA_CACHE_DS_MLA=False,
+                            MLA_CACHE_NVFP4=False, MLA_NUM_TILES=1, MLA_TILE_DIM=1,
+                            TOPK=2048, TOPK_BLOCK_SIZE=1024))
     compile_kernel(k._fwht_quant_kernel,
                    dict(q_ptr="bf16", qout_ptr="u8", sout_ptr="fp32"), dict(BLOCK_R=32), 2)
     pool = dict(PAGE_SIZE=32, BUF_NUMEL_PER_PAGE=4224, POOL_SIZE=4, HEAD_DIM=128,
