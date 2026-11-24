@@ -1,0 +1,58 @@
+name: Verify published SM80 image
+on:
+  push:
+    branches: [ci/verify-sm80-registry]
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  pull:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TAG: ghcr.io/moophlo/vllm-backport:candidate-22fee43ab3a4ba9427da3dc4
+      IMAGE: ghcr.io/moophlo/vllm-backport
+      DIGEST: sha256:3f7494bbc3a4da330e7fb7f8add94f382c067f0c4085961f88c9a39e2ca220aa
+      TREE: 66c08e59a52adb3ccfebcc81f372bb24417ccbc5
+    steps:
+      - name: Check the published tag from a clean registry client
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/sm80-registry-client"
+          mkdir -p "$DOCKER_CONFIG"
+          if docker buildx imagetools inspect "$TAG" > "$RUNNER_TEMP/manifest" 2>"$RUNNER_TEMP/anonymous-error"; then
+            access=anonymous
+          else
+            cat "$RUNNER_TEMP/anonymous-error" >&2
+            echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+            docker buildx imagetools inspect "$TAG" > "$RUNNER_TEMP/manifest"
+            access=authenticated
+          fi
+          remote=$(awk '$1=="Digest:" && !d {d=$2} END {print d}' "$RUNNER_TEMP/manifest")
+          test "$remote" = "$DIGEST"
+          echo "GHCR read-back ($access): $TAG -> $remote"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          echo "PULL_ACCESS=$access" >> "$GITHUB_ENV"
+
+      - name: Pull the Linux amd64 image by digest and inspect the installed packages
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          ref="$IMAGE@$DIGEST"
+          docker pull --quiet --platform linux/amd64 "$ref"
+          platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$ref")
+          tree=$(docker image inspect --format '{{index .Config.Labels "io.github.vllm-backport.tree"}}' "$ref")
+          test "$platform" = linux/amd64
+          test "$tree" = "$TREE"
+          docker run --rm --network none --entrypoint python3 -i "$ref" - <<'PY'
+          from importlib.metadata import version
+          from importlib.util import find_spec
+          assert version("vllm") == "0.34.0"
+          for name in ("vllm.v1.attention.ops.fp8_sm80", "vllm._C_stable_libtorch", "lmcache.cuda_ops"):
+              assert find_spec(name) is not None, name
+          print("Installed vllm", version("vllm"), "and lmcache", version("lmcache"))
+          PY
+          echo "Verified fresh $PULL_ACCESS pull of $platform $ref, tree $tree"
