@@ -27,25 +27,30 @@ RUN --mount=type=bind,source=wheels,target=/port-wheel,ro \
     uv pip freeze --system | grep -E '^(vllm|torch|torchaudio|torchvision|triton|cuda-bindings|cuda-python|cuda-toolkit)==' > /tmp/lmcache-constraints.txt; \
     uv pip install --no-cache --system -c /tmp/lmcache-constraints.txt --reinstall-package lmcache /lmcache-wheel/*.whl; \
     rm /tmp/lmcache-constraints.txt; \
-    python3 -c "import torch, lmcache, vllm._C; from vllm.v1.attention.ops import fp8_sm80"; \
+    python3 -c "import torch, lmcache; from vllm.v1.attention.ops import fp8_sm80"; \
     lmcache --help >/dev/null
-RUN --mount=from=toolkit,source=/usr/local/cuda-13.0,target=/usr/local/cuda-13.0,ro python3 - <<'PY'
+RUN --mount=from=toolkit,source=/usr/local/cuda-13.0,target=/usr/local/cuda-13.0,ro <<'CHECK_EXTENSIONS'
+set -eu
+# The builder has no GPU driver. Use the toolkit's driver stub only for this
+# import check. The published image and A100 runtime do not include the stub.
+linkcheck=$(mktemp -d)
+ln -s /usr/local/cuda-13.0/targets/x86_64-linux/lib/stubs/libcuda.so "$linkcheck/libcuda.so.1"
+LD_LIBRARY_PATH="$linkcheck:${LD_LIBRARY_PATH:-}" python3 - <<'PY'
+import importlib
 import re
 import subprocess
-from importlib.metadata import distribution
-from pathlib import Path
 
-def contains_sm80(path):
-    result = subprocess.run(
-        ["/usr/local/cuda-13.0/bin/cuobjdump", "--list-elf", str(path)],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+import torch
+
+for name in ("vllm._C_stable_libtorch", "lmcache.cuda_ops"):
+    extension = importlib.import_module(name)
+    path = extension.__file__
+    listing = subprocess.check_output(
+        ["/usr/local/cuda-13.0/bin/cuobjdump", "--list-elf", path], text=True
     )
-    return result.returncode == 0 and re.search(r"sm_80(?:[^0-9]|$)", result.stdout)
-
-for package, pattern in (("vllm", "_C*.so"), ("lmcache", "cuda_ops*.so")):
-    module_dir = Path(distribution(package).locate_file(package))
-    matches = [p.name for p in sorted(module_dir.glob(pattern)) if contains_sm80(p)]
-    if not matches:
-        raise SystemExit(f"Missing SM80 device code in {module_dir}/{pattern}")
-    print(f"Verified native sm_80 device code in {package}: {matches}", flush=True)
+    if not re.search(r"sm_80(?:[^0-9]|$)", listing):
+        raise SystemExit(f"Missing SM80 device code in {path}")
+    print(f"Verified native sm_80 device code in {path}", flush=True)
 PY
+rm -r "$linkcheck"
+CHECK_EXTENSIONS

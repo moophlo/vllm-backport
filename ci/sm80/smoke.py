@@ -156,14 +156,19 @@ def main():
     import lmcache
     from transformers import LlamaConfig
 
-    import vllm._C  # Load the native extension from this image.
+    import lmcache.cuda_ops
     from vllm import LLM, SamplingParams
+    from vllm import _custom_ops as ops
     from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
 
     capability = torch.cuda.get_device_capability(0)
     if capability != (8, 0):
         raise RuntimeError(f"Expected SM80, got {capability}")
-    print(torch.cuda.get_device_name(0), "LMCache:", lmcache.__file__, flush=True)
+    shared_memory = ops.get_max_shared_memory_per_block_device_attribute(0)
+    if shared_memory <= 0:
+        raise RuntimeError(f"Unexpected CUDA shared-memory limit: {shared_memory}")
+    print(torch.cuda.get_device_name(0), "shared memory per block:", shared_memory,
+          "LMCache:", lmcache.__file__, flush=True)
 
     # Exercise the fork's pre-SM89 FP8 lookup path against a CPU reference.
     values = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn)
