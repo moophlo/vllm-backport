@@ -681,7 +681,6 @@ def sparse_attn_indexer_kpool(
             logits = fp8_paged_mqa_logits_triton(
                 padded_q_quant_cast, kv_cache, decode_weights, seq_lens,
                 decode_metadata.block_table, max_model_len=max_pool_len,
-                indices=decode_metadata.indices,
             )
         else:
             logits = as_fp32_logits(

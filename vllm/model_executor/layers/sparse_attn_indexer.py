@@ -1163,6 +1163,8 @@ def sparse_attn_indexer(
                     "Triton fp8_paged_mqa_logits fallback does not support "
                     "FP4 indexer caches; DeepGEMM is required."
                 )
+            # MRv2 expands the page table per token. Its separate request IDs
+            # describe scheduling for DeepGEMM, not a second page-table lookup.
             logits = fp8_paged_mqa_logits_triton(
                 padded_q_quant_cast,
                 kv_cache,
@@ -1170,7 +1172,6 @@ def sparse_attn_indexer(
                 seq_lens,
                 decode_metadata.block_table,
                 max_model_len=max_model_len,
-                indices=decode_metadata.indices,
             )
         else:
             padded_q_scale, decode_weights = mqa_logits_mx_inputs(

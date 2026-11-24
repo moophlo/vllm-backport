@@ -916,10 +916,11 @@ def dense_logits_rows(max_seqlen_k: int, max_logits_bytes: int | None = None) ->
 
 
 def _supports_varlen_paged_mqa_logits() -> bool:
-    return (
-        current_platform.is_cuda()
-        and current_platform.is_device_capability_family(100)
-        and has_deep_gemm()
+    # The Triton FP8 kernel consumes MRv2's per-token context lengths and
+    # expanded page table directly, including mixed decode and verification.
+    return current_platform.is_cuda() and (
+        current_platform.is_device_capability_family(80)
+        or (current_platform.is_device_capability_family(100) and has_deep_gemm())
     )
 
 

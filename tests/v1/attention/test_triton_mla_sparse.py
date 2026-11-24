@@ -408,8 +408,9 @@ def test_sparse_attn_indexer_init_allows_sm80_fp8_and_rejects_fp4(monkeypatch):
             )
 
 
+@pytest.mark.parametrize("ragged", [False, True], ids=["uniform", "ragged"])
 def test_sparse_attn_indexer_decode_dispatch_2d_seq_lens_and_max_model_len(
-    monkeypatch,
+    monkeypatch, ragged
 ):
     """Regression test for issue #48285:
     1) Triton paged MQA logits must receive 2D `(B, next_n)` `seq_lens`.
@@ -433,6 +434,9 @@ def test_sparse_attn_indexer_decode_dispatch_2d_seq_lens_and_max_model_len(
     def _fake_paged_triton(
         q, kv_cache, weights, context_lens, block_tables, max_model_len, indices=None
     ):
+        pages = block_tables if indices is None else block_tables[indices.long()]
+        captured["first_pages"] = pages[:, 0].tolist()
+        captured["weights"] = weights[:, 0].tolist()
         captured["q_shape"] = tuple(q.shape)
         captured["context_lens_shape"] = tuple(context_lens.shape)
         captured["max_model_len"] = max_model_len
@@ -446,36 +450,49 @@ def test_sparse_attn_indexer_decode_dispatch_2d_seq_lens_and_max_model_len(
 
     monkeypatch.setattr(sai_mod, "fp8_paged_mqa_logits_triton", _fake_paged_triton)
 
-    batch_size, next_n, num_heads, head_dim = 2, 2, 32, 128
+    batch_size, num_heads, head_dim = 2, 32, 128
     max_model_len = 256
     per_batch_max_seq_len = 12
     topk_tokens = 4
     prefix = "layer.0.indexer.k_cache"
 
-    seq_lens_2d = torch.tensor([[9, 10], [11, 12]], dtype=torch.int32)
+    assert indexer_mod._supports_varlen_paged_mqa_logits()
+    if ragged:
+        # MRv2 emits one context length and page-table row for each query:
+        # two tokens from request 0 followed by one from request 1.
+        seq_lens_2d = torch.tensor([[9], [10], [12]], dtype=torch.int32)
+        first_pages = [0, 0, 3]
+        request_ids = torch.tensor([0, 0, 1], dtype=torch.int32)
+    else:
+        seq_lens_2d = torch.tensor([[9, 10], [11, 12]], dtype=torch.int32)
+        first_pages = [0, 3]
+        request_ids = None
+    table_rows, width = seq_lens_2d.shape
+    num_tokens = seq_lens_2d.numel()
     decode_meta = indexer_mod.DeepSeekV32IndexerDecodeMetadata(
-        block_table=torch.zeros((batch_size, 4), dtype=torch.int32),
+        block_table=torch.tensor(first_pages, dtype=torch.int32).view(-1, 1),
         seq_lens=seq_lens_2d,
-        decode_lens=torch.tensor([next_n, next_n], dtype=torch.int32),
+        decode_lens=torch.full((table_rows,), width, dtype=torch.int32),
         requires_padding=False,
         schedule_metadata=torch.zeros((1, 2), dtype=torch.int32),
+        indices=request_ids,
     )
     meta = indexer_mod.DeepseekV32IndexerMetadata(
         seq_lens=torch.tensor([10, 12], dtype=torch.int32),
         max_seq_len=per_batch_max_seq_len,
-        slot_mapping=torch.arange(batch_size * next_n, dtype=torch.int64),
+        slot_mapping=torch.arange(num_tokens, dtype=torch.int64),
         num_decodes=batch_size,
-        num_decode_tokens=batch_size * next_n,
+        num_decode_tokens=num_tokens,
         num_prefills=0,
         num_prefill_tokens=0,
         decode=decode_meta,
     )
 
-    num_tokens = batch_size * next_n
     hidden_states = torch.zeros((num_tokens, 16), dtype=torch.bfloat16)
     kv_cache = torch.zeros((4, 64, head_dim + 4), dtype=torch.uint8)
     q_quant = torch.zeros((num_tokens, num_heads, head_dim), dtype=torch.float8_e4m3fn)
-    weights = torch.ones((num_tokens, num_heads), dtype=torch.float32)
+    token_ids = torch.arange(num_tokens, dtype=torch.float32)
+    weights = token_ids[:, None].expand(num_tokens, num_heads)
     topk_buf = torch.full((num_tokens, topk_tokens), -1, dtype=torch.int32)
 
     with set_forward_context(
@@ -503,14 +520,13 @@ def test_sparse_attn_indexer_decode_dispatch_2d_seq_lens_and_max_model_len(
             topk_backend="torch",
         )
 
-    assert captured["q_shape"] == (batch_size, next_n, num_heads, head_dim)
-    assert captured["context_lens_shape"] == (batch_size, next_n)
+    assert captured["q_shape"] == (table_rows, width, num_heads, head_dim)
+    assert captured["context_lens_shape"] == (table_rows, width)
     assert captured["max_model_len"] == max_model_len
-    # Torch topk selected the highest 4 indices in [0, seq_len) per row.
-    assert out[0].tolist() == [8, 7, 6, 5]
-    assert out[1].tolist() == [9, 8, 7, 6]
-    assert out[2].tolist() == [10, 9, 8, 7]
-    assert out[3].tolist() == [11, 10, 9, 8]
+    assert captured["first_pages"] == first_pages
+    assert captured["weights"] == token_ids.tolist()
+    for row, length in zip(out, seq_lens_2d.flatten().tolist(), strict=True):
+        assert row.tolist() == list(range(length - 1, length - 1 - topk_tokens, -1))
 
 
 def test_sparse_attn_indexer_prefill_dispatch_uses_triton_compressed_logits(
