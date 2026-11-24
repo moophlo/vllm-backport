@@ -15,17 +15,19 @@ The original wtdcode snapshot is available at [29e66da](https://github.com/wtdco
 | Job | Default runner | Requirements |
 | --- | --- | --- |
 | Poll, merge and report | `ubuntu-24.04` | GitHub-hosted. Runs even if the builder is offline. |
-| Compile and push candidate | `vllm-sm80-build` | Linux x86-64 with Docker, Buildx/BuildKit, Git, jq, and disk space for CUDA build stages. Compilation can run on a CPU host. |
+| Build and push candidate | `ubuntu-24.04` | GitHub-hosted Linux x86-64. Set `SM80_BUILD_RUNNER` for a dedicated builder with Docker, Buildx, Git and jq. |
 | Test the candidate digest | `vllm-sm80-test` | Linux x86-64 with Docker, NVIDIA Container Toolkit and a dedicated SM80 device visible to containers. |
 | Publish release aliases | `ubuntu-24.04` | GitHub-hosted. Runs after the GPU job succeeds. |
 
-One runner can carry both custom labels. To use existing labels, set the repository Actions variables `SM80_BUILD_RUNNER` and `SM80_TEST_RUNNER`. `SM80_GPU_DEVICE` selects the Docker device ID (default `0`). `SM80_MAX_JOBS` optionally caps the CUDA build parallelism. By default the build allows one job per 4 GiB of host RAM, bounded by the CPU count. Size free disk for both Docker layers and BuildKit cache. The build uses the runner's existing default Buildx builder and its cache.
+A dedicated machine can handle both the build and GPU jobs. To use existing labels, set the repository Actions variables `SM80_BUILD_RUNNER` and `SM80_TEST_RUNNER`. `SM80_GPU_DEVICE` selects the Docker device ID (default `0`). `SM80_MAX_JOBS` optionally caps the CUDA build parallelism. By default the build allows one job per 4 GiB of host RAM, bounded by the CPU count. Size free disk for both Docker layers and BuildKit cache. The build uses the runner's existing default Buildx builder and its cache.
 
-Use dedicated runners for this public repository. This workflow accepts the schedule, trusted pushes to `master`, and manual runs on the default branch. The repository token publishes to GHCR. Package visibility and access follow the package settings.
+Use dedicated machines for any self-hosted jobs in this public repository. This workflow accepts the schedule, trusted pushes to `master`, and manual runs on the default branch. The repository token publishes to GHCR. Package visibility and access follow the package settings.
 
 ## Outputs
 
-The build targets `docker/Dockerfile`, stage `vllm-openai`, platform `linux/amd64`, with `torch_cuda_arch_list=8.0`, `nvcc_threads=1`, and `INSTALL_LMCACHE=true`. That architecture setting applies to the source build. Bundled third-party wheels can contain kernels for other architectures.
+The Linux amd64 hosted build of v0.34.0 starts with the official CUDA wheel and runtime container. The workflow verifies the wheel's release SHA-256, compares each original Python file against the release commit, applies the Python/Triton changes and regenerates wheel metadata. It resolves the runtime and CUDA toolkit images to digests, compiles the pinned LMCache fork against the runtime's PyTorch for SM80 and checks native device code in both packages with `cuobjdump`. The upstream vLLM binaries retain their multi-architecture coverage. The vLLM Python version stays at 0.34.0. The image labels record the upstream commit and the patched tree.
+
+Dedicated builders, new release bases and changes to native code or the Docker recipe use `docker/Dockerfile`, target `vllm-openai`, with `torch_cuda_arch_list=8.0`, `nvcc_threads=1`, and `INSTALL_LMCACHE=true`. After pushing a candidate, the workflow reads the tag back from GHCR and compares its digest with the build output. The GPU job and release aliases use that digest.
 
 For v0.34.0, preparation also cross-compiles the actual Triton kernels to SM80 cubins, checks Model Runner V2 metadata and compares GLM token selection against a CPU reference. It stages the sparse MLA and GLM test modules from the resolved source tree along with pytest wheels for the GPU job. That job runs the tests offline against the candidate digest.
 

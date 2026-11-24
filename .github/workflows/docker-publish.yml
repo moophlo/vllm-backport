@@ -20,7 +20,7 @@ permissions:
 
 concurrency:
   group: sm80-release-${{ github.repository }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 defaults:
   run:
@@ -111,7 +111,7 @@ jobs:
   build:
     needs: prepare
     if: needs.prepare.outputs.ready == 'true'
-    runs-on: ${{ vars.SM80_BUILD_RUNNER || 'vllm-sm80-build' }}
+    runs-on: ${{ vars.SM80_BUILD_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 1440
     permissions:
       contents: read
@@ -125,6 +125,17 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
+      - name: Reclaim space on the ephemeral hosted builder
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL
+          df -h "$GITHUB_WORKSPACE" /mnt
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: controller
+          sparse-checkout: ci/sm80
+          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: vllm-project/vllm
@@ -158,23 +169,36 @@ jobs:
         working-directory: source
         env:
           JOB_LIMIT: ${{ vars.SM80_MAX_JOBS }}
+          BUILD_ENVIRONMENT: ${{ runner.environment }}
         run: |
           jobs=${JOB_LIMIT:-$(awk '/MemTotal:/ { n=int($2/4194304); print (n>0?n:1) }' /proc/meminfo)}
           [[ $jobs =~ ^[1-9][0-9]*$ ]]
           cores=$(nproc)
           if (( jobs > cores )); then jobs=$cores; fi
-          docker buildx build --platform linux/amd64 --file docker/Dockerfile \
-            --target vllm-openai --build-arg torch_cuda_arch_list=8.0 \
-            --build-arg "max_jobs=$jobs" --build-arg nvcc_threads=1 \
-            --build-arg INSTALL_LMCACHE=true \
-            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-            --label "org.opencontainers.image.version=$UPSTREAM_TAG-sm80" \
-            --label "io.github.vllm-backport.upstream=$TARGET" \
-            --label "io.github.vllm-backport.tree=$TREE" \
-            --tag "$IMAGE:candidate-$BUILD_ID" \
-            --metadata-file "$RUNNER_TEMP/sm80-build.json" --push .
+          common=(--label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+                  --label "org.opencontainers.image.version=$UPSTREAM_TAG-sm80"
+                  --label "io.github.vllm-backport.upstream=$TARGET"
+                  --label "io.github.vllm-backport.tree=$TREE"
+                  --tag "$IMAGE:candidate-$BUILD_ID"
+                  --metadata-file "$RUNNER_TEMP/sm80-build.json" --push)
+          if [[ $BUILD_ENVIRONMENT == github-hosted &&
+                $TARGET == 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca &&
+                $(git hash-object docker/Dockerfile) == e0e4108318387af823132965b1bcb20a808cda34 ]] &&
+             git diff --quiet "$TARGET" HEAD -- . ':(top,exclude)docker/Dockerfile' \
+               ':(top,exclude)docs' ':(top,exclude)tests' ':(top,glob,exclude)vllm/**/*.py'; then
+            bash "$GITHUB_WORKSPACE/controller/ci/sm80/build-v034.sh" "$jobs" "${common[@]}"
+          else
+            docker buildx build --platform linux/amd64 --file docker/Dockerfile \
+              --target vllm-openai --build-arg torch_cuda_arch_list=8.0 \
+              --build-arg "max_jobs=$jobs" --build-arg nvcc_threads=1 \
+              --build-arg INSTALL_LMCACHE=true "${common[@]}" .
+          fi
           digest=$(jq -er '."containerimage.digest" | select(test("^sha256:[a-f0-9]{64}$"))' \
             "$RUNNER_TEMP/sm80-build.json")
+          remote=$(docker buildx imagetools inspect "$IMAGE:candidate-$BUILD_ID" |
+            awk '$1=="Digest:" && !d {d=$2} END {print d}')
+          [[ $remote == "$digest" ]] || { echo "::error::GHCR returned $remote, expected $digest"; exit 1; }
+          echo "Verified GHCR candidate $IMAGE:candidate-$BUILD_ID -> $digest"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Candidate: $IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
 
@@ -266,6 +290,12 @@ jobs:
             tags+=(-t "$IMAGE:latest-sm80")
           fi
           docker buildx imagetools create --prefer-index=false "${tags[@]}" "$IMAGE@$DIGEST"
+          for ((i=1; i<${#tags[@]}; i+=2)); do
+            remote=$(docker buildx imagetools inspect "${tags[i]}" |
+              awk '$1=="Digest:" && !d {d=$2} END {print d}')
+            [[ $remote == "$DIGEST" ]] || { echo "::error::${tags[i]} returned $remote, expected $DIGEST"; exit 1; }
+            echo "Verified GHCR alias ${tags[i]} -> $DIGEST"
+          done
           jq --arg tag "$UPSTREAM_TAG" --arg tree "$TREE" --arg image "$IMAGE@$DIGEST" \
             --arg workflow "$GITHUB_SHA" '. + {tag:$tag, tree:$tree, image:$image, workflow:$workflow}' \
             report/input.json > report/build.json
