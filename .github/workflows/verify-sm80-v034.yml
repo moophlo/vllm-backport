@@ -29,3 +29,40 @@ jobs:
       - name: Check the integrated source
         if: hashFiles('ci/sm80/check-v034.sh') != ''
         run: bash ci/sm80/check-v034.sh
+
+  a100:
+    needs: source
+    runs-on: ${{ vars.SM80_TEST_RUNNER || 'vllm-sm80-test' }}
+    timeout-minutes: 1440
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Build and run the candidate locally on SM80
+        env:
+          DEVICE: ${{ vars.SM80_GPU_DEVICE || '0' }}
+          JOB_LIMIT: ${{ vars.SM80_MAX_JOBS }}
+        run: |
+          set -euo pipefail
+          tip=$(jq -er '.patch_tip' ci/sm80/port.json)
+          base=$(jq -er '.upstream_base' ci/sm80/port.json)
+          dir="$RUNNER_TEMP/sm80-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          bash ci/sm80/prepare.sh "$dir" "$base" "$base" "$tip"
+          git -C "$dir" -c user.name=builder -c user.email=builder@localhost commit --allow-empty -qm 'SM80 qualification'
+          git -C "$dir" -c tag.gpgSign=false tag "v0.34.0+sm80.g${tip:0:12}"
+          jobs=${JOB_LIMIT:-$(awk '/MemTotal:/ { n=int($2/4194304); print (n>0?n:1) }' /proc/meminfo)}
+          [[ $jobs =~ ^[1-9][0-9]*$ ]]
+          cores=$(nproc)
+          (( jobs <= cores )) || jobs=$cores
+          image="vllm-sm80-verify:$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          trap 'docker image rm "$image" >/dev/null 2>&1 || true' EXIT
+          docker buildx build --load --platform linux/amd64 -f "$dir/docker/Dockerfile" \
+            --target vllm-openai --build-arg torch_cuda_arch_list=8.0 \
+            --build-arg "max_jobs=$jobs" --build-arg nvcc_threads=1 \
+            --build-arg INSTALL_LMCACHE=true -t "$image" "$dir"
+          docker run --rm --gpus "device=$DEVICE" --shm-size=2g \
+            -e HF_HUB_OFFLINE=1 -e VLLM_NO_USAGE_STATS=1 \
+            -v "$PWD/ci/sm80/smoke.py:/tmp/sm80_smoke.py:ro" \
+            --entrypoint python3 "$image" /tmp/sm80_smoke.py

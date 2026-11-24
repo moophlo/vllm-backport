@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 base=62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
-git fetch -q origin refs/heads/ports/v0.34.0-sm80-mrv2
-tip=$(git rev-parse FETCH_HEAD)
+tip=$(jq -er '.patch_tip' ci/sm80/port.json)
+git fetch -q origin "$tip"
 checkout="$RUNNER_TEMP/sm80-verify"
 bash ci/sm80/prepare.sh "$checkout" "$base" "$base" "$tip"
 test "$(git -C "$checkout" write-tree)" = "$(git rev-parse "$tip^{tree}")"
