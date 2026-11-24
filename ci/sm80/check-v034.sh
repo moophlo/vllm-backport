@@ -29,6 +29,8 @@ site=$("$venv/bin/python" -c 'import sysconfig; print(sysconfig.get_path("pureli
 for path in "${paths[@]}"; do
     if [[ $path == vllm/* ]]; then install -D -m 0644 "$checkout/$path" "$site/$path"; fi
 done
+TRITON_DEFAULT_BACKEND=cpu HF_HUB_OFFLINE=1 VLLM_NO_USAGE_STATS=1 \
+    "$venv/bin/python" ci/sm80/smoke.py --cpu-indexer
 cd "$RUNNER_TEMP"
 HF_HUB_OFFLINE=1 VLLM_NO_USAGE_STATS=1 "$venv/bin/python" -m pytest --noconftest --import-mode=importlib -q -ra \
     "$checkout/tests/models/test_glm5next_fp8_pp_load.py" \

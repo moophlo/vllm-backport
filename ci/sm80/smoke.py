@@ -1,15 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run inside the built image on one compute-capability 8.0 device."""
 
+import sys
 from tempfile import TemporaryDirectory
 
-import lmcache
 import torch
-from transformers import LlamaConfig
-
-import vllm._C  # Load the native extension from this image.
-from vllm import LLM, SamplingParams
-from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
 
 
 def check_glm_kpool():
@@ -89,7 +84,82 @@ def check_glm_kpool():
     print("GLM kpool FP8 queries, paged prefill, decode and four-token MTP parity passed.", flush=True)
 
 
+def check_ragged_kpool_decode(device):
+    """Score two requests with opposite key rankings in an MRv2 verification batch."""
+    from vllm.config import DeviceConfig, VllmConfig
+    from vllm.forward_context import set_forward_context
+    from vllm.models.glm5next.nvidia.sparse_indexer import sparse_attn_indexer_kpool
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepSeekV32IndexerDecodeMetadata,
+        DeepseekV32IndexerMetadata,
+    )
+    from vllm.v1.attention.ops.metadata import _indexer_decode_metadata_kernel
+
+    def ints(values):
+        return torch.tensor(values, dtype=torch.int32, device=device)
+
+    # Request 0 verifies positions 10 and 11, request 1 decodes position 11.
+    starts, final_lengths = ints([0, 2, 3]), ints([12, 12])
+    request_pages = ints([[0], [1]])
+    positions = ints([10, 11, 11])
+    rows, heads, dim, page, pool = 3, 32, 128, 32, 4
+    seq_lens = torch.empty_like(positions)
+    pages = torch.empty((rows, 1), dtype=torch.int32, device=device)
+    decode_lens, request_ids = torch.empty_like(positions), torch.empty_like(positions)
+    per_request = torch.empty_like(final_lengths)
+    _indexer_decode_metadata_kernel[(rows,)](
+        starts, final_lengths, request_pages, seq_lens, pages, decode_lens,
+        request_ids, per_request, 2, rows, rows, 1, 1, BLOCK_COLS=1,
+    )
+    prefix = "model.layers.0.self_attn.indexer.k_cache"
+    meta = DeepseekV32IndexerMetadata(
+        seq_lens=final_lengths, max_seq_len=12, slot_mapping=positions.long(),
+        num_decodes=2, num_decode_tokens=rows, num_prefills=0, num_prefill_tokens=0,
+        decode=DeepSeekV32IndexerDecodeMetadata(
+            block_table=pages, seq_lens=(seq_lens // pool).view(-1, 1),
+            decode_lens=decode_lens, requires_padding=False,
+            schedule_metadata=torch.empty(0, dtype=torch.int32, device=device),
+            indices=request_ids, per_req_decode_lens=per_request,
+        ),
+    )
+
+    cache = torch.zeros((2, page, dim + 4), dtype=torch.uint8, device=device)
+    flat = cache.view(2, -1)
+    keys = torch.zeros((2, page, dim), dtype=torch.bfloat16, device=device)
+    keys[:, :3, 0] = ints([[1, 2, 3], [3, 2, 1]])
+    flat[:, :page * dim].copy_(keys.to(torch.float8_e4m3fn).view(torch.uint8).flatten(1))
+    flat[:, page * dim:].view(torch.float32).fill_(1)
+    q = torch.ones((rows, heads, dim), dtype=torch.bfloat16, device=device)
+    weights = torch.ones((rows, heads), dtype=torch.float32, device=device)
+    topk = torch.empty((rows, 2 * pool - 1), dtype=torch.int32, device=device)
+    with set_forward_context(
+        {prefix: meta}, VllmConfig(device_config=DeviceConfig(device=device.type))
+    ):
+        sparse_attn_indexer_kpool(
+            hidden_states=q[:, 0], k_cache_prefix=prefix, kv_cache=cache,
+            q_quant=q.to(torch.float8_e4m3fn), q_scale=None, k=None, weights=weights,
+            quant_block_size=dim, scale_fmt="ue8m0", topk_tokens=pool, head_dim=dim,
+            max_pool_len=page, total_seq_lens=page, topk_indices_buffer=topk,
+            skip_k_cache_insert=True, index_kpool=pool, positions=positions,
+            topk_backend="torch",
+        )
+    expected = ints([
+        [4, 5, 6, 7, 8, 9, 10],
+        [8, 9, 10, 11, -1, -1, -1],
+        [0, 1, 2, 3, -1, -1, -1],
+    ])
+    torch.testing.assert_close(topk, expected)
+    print(f"MRv2 GLM ragged paged logits and token selection passed on {device}.")
+
+
 def main():
+    import lmcache
+    from transformers import LlamaConfig
+
+    import vllm._C  # Load the native extension from this image.
+    from vllm import LLM, SamplingParams
+    from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
+
     capability = torch.cuda.get_device_capability(0)
     if capability != (8, 0):
         raise RuntimeError(f"Expected SM80, got {capability}")
@@ -102,6 +172,7 @@ def main():
                                equal_nan=True)
 
     check_glm_kpool()
+    check_ragged_kpool_decode(torch.device("cuda", 0))
 
     with TemporaryDirectory() as model_dir:
         config = LlamaConfig(
@@ -123,4 +194,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--cpu-indexer"]:
+        from unittest.mock import patch
+
+        from vllm.platforms import current_platform
+
+        # Select the Ampere software codec while executing Triton on CPU.
+        with (
+            patch.object(current_platform, "is_device_capability_family",
+                         side_effect=lambda family: family == 80),
+            patch("vllm.v1.attention.ops.mqa_logits_triton._should_emulate_fp8",
+                  return_value=True),
+        ):
+            check_ragged_kpool_decode(torch.device("cpu"))
+    else:
+        main()
