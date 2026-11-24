@@ -1,0 +1,56 @@
+# Automatic SM80 backports
+
+GitHub Actions checks the official `vllm-project/vllm` stable release at minute 23 every six hours (UTC). Changing the workflow or the files in `ci/sm80` on `master` also starts an attempt. Run **vLLM SM80 backport** from Actions for an immediate check.
+
+The controller lives on `master`. `port.json` pins the official commit used as the base of the maintained port and the port commit containing the desired changes. The initial pins are the base documented in wtdcode's port commits and the wtdcode `master` snapshot used to create this fork. The workflow resolves the official release tag to its commit, applies the net port delta with a three-way Git merge, and preserves upstream changes in other files. This also works across diverging release branches. New fixes on wtdcode require a deliberate update of the two pins.
+
+## Runners
+
+| Job | Default runner | Requirements |
+| --- | --- | --- |
+| Poll, merge and report | `ubuntu-24.04` | GitHub-hosted. Runs even if the builder is offline. |
+| Compile and push candidate | `vllm-sm80-build` | Linux x86-64 with Docker, Buildx/BuildKit, Git, jq, and disk space for CUDA build stages. Compilation can run on a CPU host. |
+| Test the candidate digest | `vllm-sm80-test` | Linux x86-64 with Docker, NVIDIA Container Toolkit and a dedicated SM80 device visible to containers. |
+| Publish release aliases | `ubuntu-24.04` | GitHub-hosted. Runs after the GPU job succeeds. |
+
+One runner can carry both custom labels. To use existing labels, set the repository Actions variables `SM80_BUILD_RUNNER` and `SM80_TEST_RUNNER`. `SM80_GPU_DEVICE` selects the Docker device ID (default `0`). `SM80_MAX_JOBS` optionally caps the CUDA build parallelism. By default the build allows one job per 4 GiB of host RAM, bounded by the CPU count. Size free disk for both Docker layers and BuildKit cache. The build uses the runner's existing default Buildx builder and its cache.
+
+Use dedicated runners for this public repository. This workflow accepts the schedule, trusted pushes to `master`, and manual runs on the default branch. The repository token publishes to GHCR. Package visibility and access follow the package settings.
+
+## Outputs
+
+The build targets `docker/Dockerfile`, stage `vllm-openai`, platform `linux/amd64`, with `torch_cuda_arch_list=8.0`, `nvcc_threads=1`, and `INSTALL_LMCACHE=true`. That architecture setting applies to the source build. Bundled third-party wheels can contain kernels for other architectures.
+
+A successful compile uploads `ghcr.io/moophlo/vllm-backport:candidate-<build-id>`. The test pulls that exact digest, verifies compute capability 8.0, exercises the fork's FP8 lookup and runs prefill and decode with a small local BF16 Llama using dummy weights. This is a generic serving smoke test. GLM, tensor parallelism, Ray Serve and NIXL require workload qualification.
+
+Passing validation publishes `:<upstream-tag>-sm80` and, if the release is still current, `:latest-sm80`. Use the digest in `build.json` for an immutable deployment. Each successful GitHub Release attaches `backport.patch` and `build.json`. Its Git tag points to the controller revision. To reproduce the image source, check out the official commit recorded in `build.json`, run `git apply --index backport.patch` (skip an empty patch), and compare `git write-tree` with `tree` in the manifest.
+
+## Resolve a source conflict
+
+The failed run lists conflicting paths and uploads `conflicts.txt` and `conflicts.diff`. The same release, pins and recipe are skipped on subsequent polls. The manual **Retry the same source conflict** input repeats that attempt. Transient fetch failures and failed builds or GPU tests stay eligible for retry.
+
+From a checkout of this fork, use the exact upstream SHA from the failed run. The command creates a new disposable checkout with the actual release as `HEAD`, a populated Git index and normal conflict markers.
+
+```bash
+target=<official-commit-sha-from-the-run>
+candidate=../vllm-sm80-port
+bash ci/sm80/prepare.sh "$candidate" "$target" \
+    "$(jq -r .upstream_base ci/sm80/port.json)" \
+    "$(jq -r .patch_tip ci/sm80/port.json)"
+```
+
+Exit code 3 means source conflicts. Resolve them in the candidate checkout and inspect the staged changes, including CUDA paths and their tests. After staging the resolution, commit it and push the commit to a branch of this fork. For example, for release `v0.34.0` use the following commands.
+
+```bash
+git -C "$candidate" status --short
+# After editing the conflicted files
+git -C "$candidate" add -A
+git -C "$candidate" commit -m "Port SM80 changes onto v0.34.0"
+git -C "$candidate" push port HEAD:refs/heads/ports/v0.34.0
+tip=$(git -C "$candidate" rev-parse HEAD)
+jq --arg base "$target" --arg tip "$tip" \
+    '.upstream_base=$base | .patch_tip=$tip' ci/sm80/port.json > ci/sm80/port.json.new
+mv ci/sm80/port.json.new ci/sm80/port.json
+```
+
+Commit the updated `port.json` on `master` (or merge it through a PR). CI then builds the resolved port for the pinned release and uses that delta for future releases. The `port` remote defaults to this fork. Override `PORT_REMOTE` or `UPSTREAM_REMOTE` when reproducing against a different clone.

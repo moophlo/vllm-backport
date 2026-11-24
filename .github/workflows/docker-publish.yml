@@ -1,144 +1,252 @@
-name: Docker Publish
+name: vLLM SM80 backport
 
 on:
+  schedule:
+    - cron: '23 */6 * * *'
   push:
-    branches:
-      - master
-      - dsv4-a6000-opt
-    tags:
-      - "v*"
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
+    branches: [master]
+    paths:
+      - .github/workflows/docker-publish.yml
+      - ci/sm80/**
   workflow_dispatch:
+    inputs:
+      retry_conflict:
+        description: Retry the same source conflict
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 concurrency:
-  group: docker-publish-${{ github.ref }}
-  cancel-in-progress: true
+  group: sm80-release-${{ github.repository }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  cancel-stale:
-    runs-on: ubuntu-latest
+  prepare:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
-      actions: write
+      contents: write
+    outputs:
+      ready: ${{ steps.source.outputs.ready }}
+      tag: ${{ steps.plan.outputs.tag }}
+      target: ${{ steps.plan.outputs.target }}
+      id: ${{ steps.plan.outputs.id }}
+      image: ${{ steps.plan.outputs.image }}
+      release_ref: ${{ steps.plan.outputs.release_ref }}
+      tree: ${{ steps.source.outputs.tree }}
     steps:
-      - name: Cancel older in-progress runs
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Resolve the stable release and check previous attempts
+        id: plan
         env:
           GH_TOKEN: ${{ github.token }}
+          FORCE_RETRY: ${{ inputs.retry_conflict || false }}
+        run: bash ci/sm80/plan.sh
+      - name: Port the maintained delta onto the release
+        id: source
+        if: steps.plan.outputs.state == 'pending'
+        env:
+          TARGET: ${{ steps.plan.outputs.target }}
+          BASE: ${{ steps.plan.outputs.base }}
+          TIP: ${{ steps.plan.outputs.tip }}
         run: |
-          for status in in_progress queued; do
-            gh run list -R ${{ github.repository }} -w "${{ github.workflow }}" \
-              --branch "${{ github.ref_name }}" \
-              --status $status --json databaseId -q '.[].databaseId'
-          done | while read -r id; do
-            if [ "$id" != "${{ github.run_id }}" ]; then
-              gh run cancel "$id" -R ${{ github.repository }} || true
-            fi
-          done
-
-  build-and-push:
-    # On a repo with a self-hosted builder, set the repo variable
-    # BUILD_RUNNER (e.g. "self-hosted"); GitHub-hosted otherwise.
-    runs-on: self-hosted
-    timeout-minutes: 2880
-    steps:
-      - name: Free disk space
-        # GitHub-hosted runners only: a cold build overflows their small
-        # root disk. Self-hosted builders manage their own storage.
-        if: ${{ runner.environment == 'github-hosted' }}
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache /usr/local/share/boost \
-            /usr/local/.ghcup /usr/share/swift /usr/local/share/chromium \
-            /usr/local/lib/node_modules /usr/lib/google-cloud-sdk \
-            /usr/local/aws-cli /usr/local/aws-sam-cli /usr/lib/jvm \
-            /usr/lib/firefox /opt/microsoft /var/lib/gems /usr/share/miniconda
-          sudo docker image prune -af
-          # A cold full build overflows the root disk (v0.7.0 run died with
-          # "No space left on device" while packaging the wheel). The runner's
-          # second disk (/mnt, ~65 GB) is otherwise unused: move docker's
-          # data-root there so image layers and the buildkit builder don't
-          # compete with the workspace and ccache for the root filesystem.
-          sudo systemctl stop docker
-          sudo mkdir -p /mnt/docker /etc/docker
-          if [ -s /etc/docker/daemon.json ]; then
-            sudo jq '. + {"data-root": "/mnt/docker"}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
-            sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
-          else
-            echo '{"data-root": "/mnt/docker"}' | sudo tee /etc/docker/daemon.json >/dev/null
-          fi
-          sudo systemctl start docker
-          df -h / /mnt
-
-      - uses: actions/checkout@v4
-
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: ccache-dir
-          key: ccache-${{ github.run_id }}
-          restore-keys: |
-            ccache-
-
-      - uses: docker/setup-buildx-action@v3
-        with:
-          driver: docker
-
-      - name: Inject ccache into build
-        uses: reproducible-containers/buildkit-cache-dance@v3
-        with:
-          cache-map: |
+          mkdir -p "$RUNNER_TEMP/report"
+          repo="$RUNNER_TEMP/port-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          status=0
+          bash ci/sm80/prepare.sh "$repo" "$TARGET" "$BASE" "$TIP" || status=$?
+          if [[ $status == 3 ]]; then
+            git -C "$repo" diff --name-only --diff-filter=U > "$RUNNER_TEMP/report/conflicts.txt"
+            git -C "$repo" diff --cc --no-color > "$RUNNER_TEMP/report/conflicts.diff"
             {
-              "ccache-dir": "/root/.cache/ccache"
-            }
+              echo "### A source port is required"
+              echo "Conflicting paths ($(wc -l < "$RUNNER_TEMP/report/conflicts.txt"))"
+              sed 's/^/- /' "$RUNNER_TEMP/report/conflicts.txt"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ $status == 0 ]] || exit "$status"
+          tree=$(git -C "$repo" write-tree)
+          git -C "$repo" diff --binary --full-index --no-renames --cached "$TARGET" \
+            > "$RUNNER_TEMP/report/backport.patch"
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.state == 'pending'
+        with:
+          name: sm80-source-${{ steps.plan.outputs.id }}
+          path: ${{ runner.temp }}/report/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Record conflicts and stop before build
+        if: steps.source.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MARKER: ${{ steps.plan.outputs.conflict_ref }}
+        run: |
+          existing=$(git ls-remote --refs origin "refs/tags/$MARKER")
+          if [[ -z $existing ]]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$MARKER" -f sha="$GITHUB_SHA" > /dev/null
+          fi
+          echo "::error::Backport conflicts. Download the source report and see ci/sm80/README.md."
+          exit 1
 
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true'
+    runs-on: ${{ vars.SM80_BUILD_RUNNER || 'vllm-sm80-build' }}
+    timeout-minutes: 1440
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TARGET: ${{ needs.prepare.outputs.target }}
+      UPSTREAM_TAG: ${{ needs.prepare.outputs.tag }}
+      TREE: ${{ needs.prepare.outputs.tree }}
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      BUILD_ID: ${{ needs.prepare.outputs.id }}
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: ${{ needs.prepare.outputs.target }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: sm80-source-${{ needs.prepare.outputs.id }}
+          path: report
+      - name: Recreate and verify the exact merged tree
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$TARGET"
+          if [[ -s ../report/backport.patch ]]; then
+            git apply --index --whitespace=nowarn ../report/backport.patch
+          fi
+          test "$(git write-tree)" = "$TREE"
+          git -c user.name=builder -c user.email=builder@localhost -c commit.gpgSign=false \
+            commit -q --allow-empty -m "SM80 port of $UPSTREAM_TAG"
+          # The Dockerfile bind-mounts .git for setuptools-scm. Keep the local
+          # version distinct from both the official release and the fork's tags.
+          git -c tag.gpgSign=false tag --no-sign "$UPSTREAM_TAG+sm80.g$BUILD_ID"
       - uses: docker/login-action@v3
         with:
-          username: lazymio
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Size build parallelism to this runner
-        id: parallelism
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push the SM80 candidate
+        id: build
+        working-directory: source
+        env:
+          JOB_LIMIT: ${{ vars.SM80_MAX_JOBS }}
         run: |
-          CORES=$(nproc)
-          MEM_GB=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024 / 1024 ))
-          JOBS=$(( MEM_GB / 4 ))
-          [ "$JOBS" -gt "$CORES" ] && JOBS=$CORES
-          [ "$JOBS" -lt 2 ] && JOBS=2
-          echo "max_jobs=$JOBS" >> "$GITHUB_OUTPUT"
+          jobs=${JOB_LIMIT:-$(awk '/MemTotal:/ { n=int($2/4194304); print (n>0?n:1) }' /proc/meminfo)}
+          [[ $jobs =~ ^[1-9][0-9]*$ ]]
+          cores=$(nproc)
+          if (( jobs > cores )); then jobs=$cores; fi
+          docker buildx build --platform linux/amd64 --file docker/Dockerfile \
+            --target vllm-openai --build-arg torch_cuda_arch_list=8.0 \
+            --build-arg "max_jobs=$jobs" --build-arg nvcc_threads=1 \
+            --build-arg INSTALL_LMCACHE=true \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$UPSTREAM_TAG-sm80" \
+            --label "io.github.vllm-backport.upstream=$TARGET" \
+            --label "io.github.vllm-backport.tree=$TREE" \
+            --tag "$IMAGE:candidate-$BUILD_ID" \
+            --metadata-file "$RUNNER_TEMP/sm80-build.json" --push .
+          digest=$(jq -er '."containerimage.digest" | select(test("^sha256:[a-f0-9]{64}$"))' \
+            "$RUNNER_TEMP/sm80-build.json")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Candidate: $IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Compute image tags
-        id: tags
-        # One image now carries cubins for sm80, sm86 and sm89, so the old
-        # per-arch tags become aliases for it. They are still published so
-        # existing `:latest-sm86` / `:v0.11.3-sm80` pulls keep working.
-        run: |
-          repo=lazymio/vllm-backport
-          tags="$repo:latest,$repo:latest-sm80,$repo:latest-sm86,$repo:latest-sm89"
-          case "${{ github.ref }}" in
-            refs/tags/*)
-              v="${{ github.ref_name }}"
-              # Tag builds publish the version tags *and* move the rolling
-              # latest tags, so latest tracks the newest build rather than the
-              # last branch push.
-              tags="$repo:$v,$repo:$v-sm80,$repo:$v-sm86,$repo:$v-sm89,$tags"
-              ;;
-          esac
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
-          echo "$tags" | tr ',' '\n'
-
-      - uses: docker/build-push-action@v6
-        timeout-minutes: 2400
+  validate:
+    needs: [prepare, build]
+    runs-on: ${{ vars.SM80_TEST_RUNNER || 'vllm-sm80-test' }}
+    timeout-minutes: 30
+    permissions:
+      packages: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
         with:
-          context: .
-          file: docker/Dockerfile
-          target: vllm-openai
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=registry,ref=lazymio/vllm-backport:buildcache
-          cache-to: type=registry,ref=lazymio/vllm-backport:buildcache,mode=max,compression=zstd,ignore-error=true
-          build-args: |
-            torch_cuda_arch_list=8.0 8.6 8.9
-            max_jobs=${{ steps.parallelism.outputs.max_jobs }}
-            nvcc_threads=1
-            INSTALL_LMCACHE=true
+          persist-credentials: false
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Run offline FP8 and generation checks on SM80
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          DEVICE: ${{ vars.SM80_GPU_DEVICE || '0' }}
+        run: |
+          docker pull "$IMAGE@$DIGEST"
+          docker run --rm --gpus "device=$DEVICE" --shm-size=2g \
+            -e HF_HUB_OFFLINE=1 -e VLLM_NO_USAGE_STATS=1 \
+            -v "$PWD/ci/sm80/smoke.py:/tmp/sm80_smoke.py:ro" \
+            --entrypoint python3 "$IMAGE@$DIGEST" /tmp/sm80_smoke.py
+
+  publish:
+    needs: [prepare, build, validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+      UPSTREAM_TAG: ${{ needs.prepare.outputs.tag }}
+      TARGET: ${{ needs.prepare.outputs.target }}
+      TREE: ${{ needs.prepare.outputs.tree }}
+      RELEASE_REF: ${{ needs.prepare.outputs.release_ref }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sm80-source-${{ needs.prepare.outputs.id }}
+          path: report
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Promote the tested digest and publish the source patch
+        run: |
+          official=$(gh api "repos/vllm-project/vllm/commits/$UPSTREAM_TAG" --jq .sha)
+          test "$official" = "$TARGET"
+          tags=(-t "$IMAGE:$UPSTREAM_TAG-sm80")
+          latest=$(gh api repos/vllm-project/vllm/releases/latest --jq .tag_name)
+          current=$(gh api "repos/vllm-project/vllm/commits/$latest" --jq .sha)
+          if [[ $latest == "$UPSTREAM_TAG" && $current == "$TARGET" ]]; then
+            tags+=(-t "$IMAGE:latest-sm80")
+          fi
+          docker buildx imagetools create --prefer-index=false "${tags[@]}" "$IMAGE@$DIGEST"
+          jq -n --arg tag "$UPSTREAM_TAG" --arg upstream "$TARGET" --arg tree "$TREE" \
+            --arg image "$IMAGE@$DIGEST" --arg workflow "$GITHUB_SHA" \
+            '{tag:$tag, upstream:$upstream, tree:$tree, image:$image, workflow:$workflow}' \
+            > report/build.json
+          notes="Tested on SM80. Pull $IMAGE@$DIGEST. Apply backport.patch to upstream commit $TARGET to reproduce source tree $TREE. The release tag identifies the CI revision."
+          if gh release view "$RELEASE_REF" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_REF" -R "$GITHUB_REPOSITORY" --clobber \
+              report/build.json report/backport.patch
+            gh release edit "$RELEASE_REF" -R "$GITHUB_REPOSITORY" --draft=false --latest=false --notes "$notes"
+          else
+            gh release create "$RELEASE_REF" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --latest=false --title "$UPSTREAM_TAG SM80" --notes "$notes" \
+              report/build.json report/backport.patch
+          fi
+          echo "Published $IMAGE@$DIGEST" >> "$GITHUB_STEP_SUMMARY"

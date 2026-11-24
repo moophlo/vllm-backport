@@ -1,5 +1,13 @@
 # vLLM Backport
 
+## SM80 builds in this fork
+
+This fork tracks stable vLLM releases and builds a Linux x86-64 image for A100. Each candidate must pass a compute-capability check, an FP8 lookup test and an offline generation test on SM80 before the workflow publishes the versioned image and `latest-sm80` to GHCR.
+
+[Build status](https://github.com/moophlo/vllm-backport/actions/workflows/docker-publish.yml) · [Runner setup and conflict resolution](ci/sm80/README.md) · [Validated releases and source patches](https://github.com/moophlo/vllm-backport/releases)
+
+## Original wtdcode backport
+
 A vLLM fork that focuses on running frontier models on older cards like A6000, 3090 and A100.
 
 Status:
