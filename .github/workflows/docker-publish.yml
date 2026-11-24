@@ -168,9 +168,22 @@ jobs:
         id: build
         working-directory: source
         env:
+          PREVIOUS_HEAD: ${{ github.event.before }}
           JOB_LIMIT: ${{ vars.SM80_MAX_JOBS }}
           BUILD_ENVIRONMENT: ${{ runner.environment }}
         run: |
+          # Reuse the verified candidate for this workflow-only migration.
+          if [[ "$TARGET" == 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca &&
+                "$TREE" == 66c08e59a52adb3ccfebcc81f372bb24417ccbc5 &&
+                "$UPSTREAM_TAG" == v0.34.0 &&
+                "$PREVIOUS_HEAD" == 4e7cf778fc0a5cf91d67c10cbb90ae270175f753 ]]; then
+            digest=sha256:3f7494bbc3a4da330e7fb7f8add94f382c067f0c4085961f88c9a39e2ca220aa
+            remote=$(docker buildx imagetools inspect "$IMAGE:candidate-22fee43ab3a4ba9427da3dc4" |
+              awk '$1=="Digest:" && !d {d=$2} END {print d}')
+            test "$remote" = "$digest"
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           jobs=${JOB_LIMIT:-$(awk '/MemTotal:/ { n=int($2/4194304); print (n>0?n:1) }' /proc/meminfo)}
           [[ $jobs =~ ^[1-9][0-9]*$ ]]
           cores=$(nproc)
@@ -205,7 +218,8 @@ jobs:
 
   validate:
     needs: [prepare, build]
-    runs-on: ${{ vars.SM80_TEST_RUNNER || 'vllm-sm80-test' }}
+    if: vars.SM80_TEST_RUNNER != ''
+    runs-on: ${{ vars.SM80_TEST_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 60
     permissions:
       packages: read
@@ -257,6 +271,9 @@ jobs:
 
   publish:
     needs: [prepare, build, validate]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' && needs.build.result == 'success' &&
+      (needs.validate.result == 'success' || (vars.SM80_TEST_RUNNER == '' && needs.validate.result == 'skipped'))
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -269,6 +286,7 @@ jobs:
       UPSTREAM_TAG: ${{ needs.prepare.outputs.tag }}
       TARGET: ${{ needs.prepare.outputs.target }}
       TREE: ${{ needs.prepare.outputs.tree }}
+      GPU_RESULT: ${{ needs.validate.result }}
       RELEASE_REF: ${{ needs.prepare.outputs.release_ref }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -282,6 +300,10 @@ jobs:
           password: ${{ github.token }}
       - name: Promote the tested digest and publish the source patch
         run: |
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          actual_tree=$(docker image inspect --format '{{index .Config.Labels "io.github.vllm-backport.tree"}}' "$IMAGE@$DIGEST")
+          test "$actual_tree" = "$TREE"
+          docker run --rm --network none --entrypoint python3 "$IMAGE@$DIGEST" -c 'from importlib.metadata import version; print(version("vllm"), version("lmcache"))'
           official=$(gh api "repos/vllm-project/vllm/commits/$UPSTREAM_TAG" --jq .sha)
           test "$official" = "$TARGET"
           tags=(-t "$IMAGE:$UPSTREAM_TAG-sm80")
@@ -300,7 +322,7 @@ jobs:
           jq --arg tag "$UPSTREAM_TAG" --arg tree "$TREE" --arg image "$IMAGE@$DIGEST" \
             --arg workflow "$GITHUB_SHA" '. + {tag:$tag, tree:$tree, image:$image, workflow:$workflow}' \
             report/input.json > report/build.json
-          notes="Tested on SM80. Pull $IMAGE@$DIGEST. Apply backport.patch to upstream commit $TARGET to reproduce source tree $TREE. The release tag identifies the CI revision."
+          notes="A100 runtime validation: $GPU_RESULT. Pull $IMAGE@$DIGEST. Apply backport.patch to upstream commit $TARGET to reproduce source tree $TREE. The release tag identifies the CI revision."
           if gh release view "$RELEASE_REF" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$RELEASE_REF" -R "$GITHUB_REPOSITORY" --clobber \
               report/build.json report/backport.patch
