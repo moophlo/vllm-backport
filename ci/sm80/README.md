@@ -6,9 +6,9 @@ The controller lives on `master`. `port.json` pins the official release commit a
 
 ## v0.34.0 and Model Runner V2
 
-The port for v0.34.0 covers the shared DeepSeek V3.2 sparse MLA path, the GLM-5.3-Flash pooled indexer and GLM pipeline-parallel loading. On Ampere the indexer uses software E4M3 conversion and Triton paged logits. During decode it uses the physical page-table row and causal context length that Model Runner V2 prepares for each query token, including mixed speculative verification lengths. The sparse MLA backend supports the main latent cache in BF16 or FP16. The indexer keeps its separate packed FP8 cache.
+The port for v0.34.0 covers the shared DeepSeek V3.2 sparse MLA path, the GLM-5.3-Flash pooled indexer and GLM pipeline-parallel loading. On Ampere the indexer uses software E4M3 conversion and Triton paged logits. During decode it uses the physical page-table row and causal context length that Model Runner V2 prepares for each query token, including mixed speculative verification lengths. The sparse MLA backend supports the main latent cache in BF16 or FP16. The indexer keeps its separate packed FP8 cache. The fused DSA query kernel guards the FP8 packing instructions at compile time so the BF16 specialization can compile for SM80.
 
-The original wtdcode snapshot is available at [29e66da](https://github.com/wtdcode/vllm-backport/tree/29e66dad461b11caae6039f510eaa7913f9dfb19). Its DeepSeek V4/V4.1 and Qwen-specific optimizations have separate code paths and are outside this release port's coverage. [Source changes](https://github.com/moophlo/vllm-backport/compare/62d4bc3c7e33b1b6c906e233e6af2d3506c482ca...9f60dd276313d225ee7da38f520652904cee8ebe) · [SM80 cross-compilation and CPU numerical checks](https://github.com/moophlo/vllm-backport/actions/runs/45370982907/job/138364876390)
+The original wtdcode snapshot is available at [29e66da](https://github.com/wtdcode/vllm-backport/tree/29e66dad461b11caae6039f510eaa7913f9dfb19). Its DeepSeek V4/V4.1 and Qwen-specific optimizations have separate code paths and are outside this release port's coverage. [Source changes](https://github.com/moophlo/vllm-backport/compare/62d4bc3c7e33b1b6c906e233e6af2d3506c482ca...b2bfa4f6ab834e99b694863aef136c89a4cdc33a) · [SM80 cross-compilation and CPU numerical checks](https://github.com/moophlo/vllm-backport/actions/runs/45372873372/job/138371344388)
 
 ## Runners
 
@@ -26,6 +26,8 @@ Use dedicated runners for this public repository. This workflow accepts the sche
 ## Outputs
 
 The build targets `docker/Dockerfile`, stage `vllm-openai`, platform `linux/amd64`, with `torch_cuda_arch_list=8.0`, `nvcc_threads=1`, and `INSTALL_LMCACHE=true`. That architecture setting applies to the source build. Bundled third-party wheels can contain kernels for other architectures.
+
+For v0.34.0, preparation also cross-compiles the actual Triton kernels to SM80 cubins, checks Model Runner V2 metadata and compares GLM token selection against a CPU reference. It stages the sparse MLA and GLM test modules from the resolved source tree along with pytest wheels for the GPU job. That job runs the tests offline against the candidate digest.
 
 A successful compile uploads `ghcr.io/moophlo/vllm-backport:candidate-<build-id>`. The test pulls that exact digest, verifies compute capability 8.0, exercises the FP8 lookup, checks GLM kpool prefill and decode against an independent CPU reference (including four-token verification, non-contiguous cache pages and mixed-length requests that select different tokens), and runs prefill and decode with a small local BF16 Llama using dummy weights. A full GLM checkpoint, tensor parallelism, Ray Serve and NIXL require workload qualification.
 
